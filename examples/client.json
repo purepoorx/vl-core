@@ -1,0 +1,10 @@
+{
+  "role": "client",
+  "listen": "127.0.0.1:1080",
+  "inbound": "socks5",
+  "logLevel": "info",
+  "server": {
+    "address": "127.0.0.1:10086",
+    "id": "b831381d-6324-4d53-ad4f-8cda48b30811"
+  }
+}

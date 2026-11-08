@@ -1,0 +1,22 @@
+{
+  "role": "client",
+  "listen": "127.0.0.1:1080",
+  "inbound": "socks5",
+  "logLevel": "info",
+  "server": {
+    "address": "your-domain.com:443",
+    "id": "b831381d-6324-4d53-ad4f-8cda48b30811",
+    "transport": {
+      "network": "ws",
+      "ws": {
+        "path": "/ray",
+        "host": "your-domain.com"
+      },
+      "tls": {
+        "enable": true,
+        "serverName": "your-domain.com",
+        "insecureSkipVerify": false
+      }
+    }
+  }
+}

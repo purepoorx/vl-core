@@ -1,0 +1,20 @@
+{
+  "role": "server",
+  "listen": "0.0.0.0:443",
+  "logLevel": "info",
+  "users": [
+    {
+      "id": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "email": "alice"
+    }
+  ],
+  "transport": {
+    "network": "tcp",
+    "tls": {
+      "enable": true,
+      "certFile": "/path/to/fullchain.pem",
+      "keyFile": "/path/to/privkey.pem",
+      "alpn": ["h2", "http/1.1"]
+    }
+  }
+}

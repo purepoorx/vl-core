@@ -1,0 +1,22 @@
+{
+  "role": "server",
+  "listen": "127.0.0.1:8080",
+  "logLevel": "info",
+  "users": [
+    {
+      "id": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "email": "alice"
+    }
+  ],
+  "transport": {
+    "network": "ws",
+    "ws": {
+      "path": "/ray"
+    },
+    "tls": {
+      "enable": true,
+      "certFile": "/path/to/fullchain.pem",
+      "keyFile": "/path/to/privkey.pem"
+    }
+  }
+}

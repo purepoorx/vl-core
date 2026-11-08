@@ -1,0 +1,23 @@
+# Build output / release assets
+/dist/
+/stage/
+/out/
+/vl-core
+vl-core.exe
+*.test
+*.out
+
+# Local certificates and private keys (never commit)
+*.pem
+*.key
+*.crt
+*.p12
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# WorkBuddy local project data
+.workbuddy-ai/
