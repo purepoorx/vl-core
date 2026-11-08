@@ -13,8 +13,9 @@ import (
 )
 
 const (
-	xrayStreamTCP = `{"network":"tcp","security":"none"}`
-	xrayStreamWS  = `{"network":"ws","wsSettings":{"path":"/ray"}}`
+	xrayStreamTCP  = `{"network":"tcp","security":"none"}`
+	xrayStreamWS   = `{"network":"ws","wsSettings":{"path":"/ray"}}`
+	xrayStreamWSED = `{"network":"ws","wsSettings":{"path":"/ray?ed=2048"}}`
 )
 
 // These tests cross-check the wire format against the real Xray-core binary.
@@ -278,5 +279,64 @@ func TestInteropWithOfficialXray(t *testing.T) {
 		conn := socksConnect(t, socksAddr, host, port)
 		defer conn.Close()
 		echoCheck(t, conn, "official Xray WS client -> vl-core WS server")
+	})
+
+	// WS 0-RTT: Xray's "?ed=2048" puts the first upstream bytes into
+	// Sec-WebSocket-Protocol. Both directions are checked here.
+	t.Run("vlcore-server-ws-xray-client-0rtt", func(t *testing.T) {
+		target := startTCPEcho(t)
+		host, port := splitHostPort(t, target)
+
+		srv, err := NewServer(&Config{
+			Role:      "server",
+			Listen:    "127.0.0.1:0",
+			Users:     []UserConfig{{ID: itestUUID, Email: "alice"}},
+			Transport: &transport.Config{Network: "ws", WS: &transport.WSConfig{Path: "/ray"}},
+		}, testLogger())
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() { _ = srv.Serve() }()
+		_, vlessPort := splitHostPort(t, waitAddr(t, srv.Addr).String())
+		t.Cleanup(func() { _ = srv.Close() })
+
+		socksPort := freePort(t)
+		startXray(t, bin, fmt.Sprintf(xrayClientConfig, socksPort, int(vlessPort), itestUUID, xrayStreamWSED))
+		socksAddr := fmt.Sprintf("127.0.0.1:%d", socksPort)
+		waitTCP(t, socksAddr)
+
+		conn := socksConnect(t, socksAddr, host, port)
+		defer conn.Close()
+		echoCheck(t, conn, "official Xray WS 0-RTT client -> vl-core WS server")
+	})
+
+	t.Run("xray-server-ws-vlcore-client-0rtt", func(t *testing.T) {
+		target := startTCPEcho(t)
+		host, port := splitHostPort(t, target)
+		xrayPort := freePort(t)
+		startXray(t, bin, fmt.Sprintf(xrayServerConfig, xrayPort, itestUUID, xrayStreamWS))
+		xrayAddr := fmt.Sprintf("127.0.0.1:%d", xrayPort)
+		waitTCP(t, xrayAddr)
+
+		cli, err := NewClient(&Config{
+			Role:    "client",
+			Listen:  "127.0.0.1:0",
+			Inbound: "socks5",
+			Server: &ServerConfig{
+				Address:   xrayAddr,
+				ID:        itestUUID,
+				Transport: &transport.Config{Network: "ws", WS: &transport.WSConfig{Path: "/ray", Ed: 2048}},
+			},
+		}, testLogger())
+		if err != nil {
+			t.Fatal(err)
+		}
+		go func() { _ = cli.Serve() }()
+		waitAddr(t, cli.Addr)
+		t.Cleanup(func() { _ = cli.Close() })
+
+		conn := socksConnect(t, cli.Addr().String(), host, port)
+		defer conn.Close()
+		echoCheck(t, conn, "vl-core WS 0-RTT client -> official Xray WS server")
 	})
 }

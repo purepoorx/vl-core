@@ -6,7 +6,7 @@
 
 实现时逐行对照了官方源码的字节语义：`proxy/vless/encoding/encoding.go`、`encoding/addons.go`、`validator.go`、`common/protocol/address.go`、`inbound/inbound.go`、`outbound/outbound.go`。
 
-**互通已实测**：用源码编译的官方 Xray `26.10.31` 做了 6 组双向交叉验证（raw TCP、UDP、WebSocket × 客户端/服务端两个方向），全部通过。
+**互通已实测**：用源码编译的官方 Xray `26.10.31` 做了 8 组双向交叉验证（raw TCP、UDP、WebSocket × 客户端/服务端两个方向，以及 WebSocket 0-RTT 双向），全部通过。
 
 ---
 
@@ -101,6 +101,34 @@ xray run -c examples/xray-client.json
 
 ---
 
+## WebSocket 0-RTT
+
+兼容官方 Xray 的 `?ed=2048`：把 VLESS 请求头用 `base64.RawURLEncoding` 放进握手请求的 `Sec-WebSocket-Protocol`，服务端在返回 101 之前就能拿到目标地址，省掉「等握手响应才能发首包」的一个 RTT。**这是 WS 层的 0-RTT，不是 TLS 1.3 的 0-RTT**；TCP / TLS 握手照常。
+
+客户端开启（两种写法等价）：
+
+```json
+"transport": {
+  "network": "ws",
+  "ws": {"path": "/ray", "ed": 2048}
+}
+```
+
+```json
+"ws": {"path": "/ray?ed=2048"}
+```
+
+服务端**无需配置**：会自动接收并解析 `Sec-WebSocket-Protocol`（兼容老版 V2Ray 的标准 base64 写法），在 101 中回显，并把解码结果作为连接读流的前缀交给 VLESS 入站。因此现在可以对接开了 `?ed=` 的官方 Xray 客户端；不开 `?ed=` 的客户端照常工作。
+
+行为细节：
+
+- 仅当 `ed > 0` 且 VLESS 请求头长度不超过 `ed` 时启用，否则自动退化为普通握手。
+- 只把 VLESS 请求头放进握手，业务首包仍走正常 WS 帧，避免为「服务端先说话」的协议引入等待。
+- 解码上限 8192 字节；非法或超长的 header 被忽略，连接退化为普通 WebSocket。
+- `Sec-WebSocket-Protocol` 是 HTTP 头：WSS 下虽在 TLS 内，CDN 仍可见且可能改写/记录，也没有 TLS 1.3 early data 的重放保护。CDN 常有 8KB 头长度限制，`ed` 建议 2048。
+
+---
+
 ## 作为协议库使用
 
 ```go
@@ -136,7 +164,8 @@ UDP 用 `protocol.WritePacket` / `protocol.ReadPacket`；`protocol.MarshalAddons
 | UDP 长度分包、多目标会话 | Fallback / 伪装站点、PROXY protocol |
 | raw TCP / TLS / WebSocket / WSS | gRPC、QUIC、HTTP/2、mkcp 等传输 |
 | SOCKS5（CONNECT + UDP ASSOCIATE）、HTTP CONNECT | 路由、策略、流量统计、DNS 内部解析、UDP full-cone |
-| 多用户、握手/会话超时、完整测试 | CDN 场景的 WS early-data |
+| 多用户、握手/会话超时、完整测试 | TLS 1.3 0-RTT、XHTTP H2/H3 |
+| WebSocket 0-RTT（`?ed=N` / `ed`，双向互通官方 Xray） | — |
 
 **关键限制**：`Addons.Flow` 可以正确编解码（例如 `xtls-rprx-vision`），但**数据面按普通字节流透传**，没有实现 Vision 的 TLS 握手识别与填充逻辑。因此只能对接 **`flow` 留空** 的官方 Xray 节点；如果服务端用户配置了 `flow: "xtls-rprx-vision"`，官方 Xray 会要求客户端配合 Vision，本项目无法互通。REALITY 节点同理不支持。要连这类节点请直接用官方 Xray。
 
@@ -161,7 +190,8 @@ go test ./...
 
 - `protocol/`：UUID、Addons wire format（含与 `proto.Marshal` 一致的黄金字节）、IPv4/IPv6/域名地址 round-trip、**与官方 `EncodeRequestHeader` 等价的请求头黄金向量**、Vision/Mux/Rvs 头、用户校验与路由字节、各类畸形输入、响应头、UDP 分包。
 - `transport/`：WebSocket 握手、客户端掩码、大包与部分读、分片消息、ping/pong。
-- `core/`：端到端 TCP echo、HTTP CONNECT、TLS、WebSocket、WSS、SOCKS5 UDP ASSOCIATE、未知 UUID 拒绝。
+- `core/`：端到端 TCP echo、HTTP CONNECT、TLS、WebSocket、WSS、SOCKS5 UDP ASSOCIATE、未知 UUID 拒绝，以及 WS 0-RTT 的 TCP / UDP 链路。
+- `core/xray_interop_test.go`（env-gated，`VL_CORE_XRAY_BIN`）：与官方 Xray 的 8 组交叉互通，含 `?ed=2048` 0-RTT 双向。
 
 ---
 

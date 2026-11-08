@@ -11,6 +11,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +31,12 @@ const (
 	// Guard against a peer announcing an absurd frame size.
 	maxFrameSize   = 16 << 20
 	maxMessageSize = 32 << 20
+
+	// Sec-WebSocket-Protocol carries base64url-encoded early data. Bound the
+	// decoded size so a hostile handshake cannot pin memory; 8192 bytes is
+	// already well above the 2048 that most CDNs are comfortable with.
+	maxEarlyData       = 8192
+	maxEarlyDataHeader = 12288
 )
 
 func wsAcceptKey(key string) string {
@@ -37,19 +45,75 @@ func wsAcceptKey(key string) string {
 	return base64.StdEncoding.EncodeToString(h.Sum(nil))
 }
 
-func wsPath(cfg *WSConfig) string {
-	if cfg != nil && cfg.Path != "" {
-		if !strings.HasPrefix(cfg.Path, "/") {
-			return "/" + cfg.Path
-		}
-		return cfg.Path
+type wsSettings struct {
+	target string // path + any non-ed query, used as the HTTP request target
+	path   string // path only, used to validate inbound requests
+	ed     int    // client-side early-data limit; 0 disables WS 0-RTT
+}
+
+// resolveWSPath accepts both the dedicated "ed" field and Xray's historical
+// "path?ed=2048" spelling. The ed parameter is stripped from the request
+// target, matching Xray's infra/conf/transport_method.go.
+func resolveWSPath(cfg *WSConfig) wsSettings {
+	ed := 0
+	if cfg != nil {
+		ed = cfg.Ed
 	}
-	return "/"
+	p := "/"
+	if cfg != nil && cfg.Path != "" {
+		p = cfg.Path
+		if !strings.HasPrefix(p, "/") {
+			p = "/" + p
+		}
+	}
+	if i := strings.IndexByte(p, '?'); i >= 0 {
+		base, rawQuery := p[:i], p[i+1:]
+		if q, err := url.ParseQuery(rawQuery); err == nil {
+			if v := q.Get("ed"); v != "" {
+				if n, e := strconv.Atoi(v); e == nil && n > 0 {
+					ed = n
+				}
+				q.Del("ed")
+				rawQuery = q.Encode()
+			}
+		}
+		if rawQuery != "" {
+			p = base + "?" + rawQuery
+		} else {
+			p = base
+		}
+	}
+	if p == "" {
+		p = "/"
+	}
+	pathOnly := p
+	if j := strings.IndexByte(p, '?'); j >= 0 {
+		pathOnly = p[:j]
+	}
+	if ed < 0 {
+		ed = 0
+	}
+	if ed > maxEarlyData {
+		ed = maxEarlyData
+	}
+	return wsSettings{target: p, path: pathOnly, ed: ed}
+}
+
+func wsPath(cfg *WSConfig) string {
+	return resolveWSPath(cfg).path
 }
 
 // ClientHandshake performs the RFC 6455 opening handshake and returns a
 // net.Conn over which VLESS bytes can be exchanged as binary messages.
 func ClientHandshake(conn net.Conn, cfg *WSConfig, dialAddress string) (net.Conn, error) {
+	return ClientHandshakeWithEarlyData(conn, cfg, dialAddress, nil)
+}
+
+// ClientHandshakeWithEarlyData is ClientHandshake with WS 0-RTT: earlyData is
+// base64url-encoded into Sec-WebSocket-Protocol and travels with the HTTP
+// Upgrade request instead of waiting for the 101 response. The caller MUST
+// NOT write those bytes again on the returned connection.
+func ClientHandshakeWithEarlyData(conn net.Conn, cfg *WSConfig, dialAddress string, earlyData []byte) (net.Conn, error) {
 	host := ""
 	if cfg != nil && cfg.Host != "" {
 		host = cfg.Host
@@ -62,14 +126,20 @@ func ClientHandshake(conn net.Conn, cfg *WSConfig, dialAddress string) (net.Conn
 		return nil, err
 	}
 	secKey := base64.StdEncoding.EncodeToString(key[:])
-	path := wsPath(cfg)
-	req := fmt.Sprintf("GET %s HTTP/1.1\r\n"+
+	s := resolveWSPath(cfg)
+
+	var req strings.Builder
+	fmt.Fprintf(&req, "GET %s HTTP/1.1\r\n"+
 		"Host: %s\r\n"+
 		"Upgrade: websocket\r\n"+
 		"Connection: Upgrade\r\n"+
 		"Sec-WebSocket-Key: %s\r\n"+
-		"Sec-WebSocket-Version: 13\r\n\r\n", path, host, secKey)
-	if err := writeAll(conn, []byte(req)); err != nil {
+		"Sec-WebSocket-Version: 13\r\n", s.target, host, secKey)
+	if len(earlyData) > 0 {
+		fmt.Fprintf(&req, "Sec-WebSocket-Protocol: %s\r\n", base64.RawURLEncoding.EncodeToString(earlyData))
+	}
+	req.WriteString("\r\n")
+	if err := writeAll(conn, []byte(req.String())); err != nil {
 		return nil, err
 	}
 
@@ -84,10 +154,13 @@ func ClientHandshake(conn net.Conn, cfg *WSConfig, dialAddress string) (net.Conn
 	if got, want := resp.Header.Get("Sec-WebSocket-Accept"), wsAcceptKey(secKey); got != want {
 		return nil, errors.New("websocket handshake: bad Sec-WebSocket-Accept")
 	}
-	return newWSConn(conn, br, true), nil
+	return newWSConn(conn, br, true, nil), nil
 }
 
 // ServerHandshake performs the server side of the RFC 6455 opening handshake.
+// If the client sent early data in Sec-WebSocket-Protocol (Xray's "?ed=N"),
+// it is decoded and prepended to the returned connection's read stream so the
+// VLESS inbound sees it as the first bytes of the request.
 func ServerHandshake(conn net.Conn, cfg *WSConfig) (net.Conn, error) {
 	br := bufio.NewReader(conn)
 	req, err := http.ReadRequest(br)
@@ -108,20 +181,54 @@ func ServerHandshake(conn net.Conn, cfg *WSConfig) (net.Conn, error) {
 		_ = writeAll(conn, []byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
 		return nil, errors.New("websocket handshake: missing Sec-WebSocket-Key")
 	}
-	resp := fmt.Sprintf("HTTP/1.1 101 Switching Protocols\r\n"+
+
+	proto := req.Header.Get("Sec-WebSocket-Protocol")
+	early := decodeEarlyData(proto)
+
+	var resp strings.Builder
+	fmt.Fprintf(&resp, "HTTP/1.1 101 Switching Protocols\r\n"+
 		"Upgrade: websocket\r\n"+
 		"Connection: Upgrade\r\n"+
-		"Sec-WebSocket-Accept: %s\r\n\r\n", wsAcceptKey(key))
-	if err := writeAll(conn, []byte(resp)); err != nil {
+		"Sec-WebSocket-Accept: %s\r\n", wsAcceptKey(key))
+	if len(early) > 0 {
+		fmt.Fprintf(&resp, "Sec-WebSocket-Protocol: %s\r\n", proto)
+	}
+	resp.WriteString("\r\n")
+	if err := writeAll(conn, []byte(resp.String())); err != nil {
 		return nil, err
 	}
-	return newWSConn(conn, br, false), nil
+	return newWSConn(conn, br, false, early), nil
+}
+
+var earlyDataReplacer = strings.NewReplacer("+", "-", "/", "_", "=", "")
+
+// decodeEarlyData accepts Xray's base64.RawURLEncoding as well as the older
+// V2Ray spelling (standard base64 with padding). Invalid or oversized values
+// are ignored, which keeps the connection usable as a plain WebSocket.
+func decodeEarlyData(proto string) []byte {
+	if proto == "" || len(proto) > maxEarlyDataHeader {
+		return nil
+	}
+	for i := 0; i < len(proto); i++ {
+		c := proto[i]
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+			c == '-' || c == '_' || c == '+' || c == '/' || c == '=' {
+			continue
+		}
+		return nil
+	}
+	b, err := base64.RawURLEncoding.DecodeString(earlyDataReplacer.Replace(proto))
+	if err != nil || len(b) == 0 || len(b) > maxEarlyData {
+		return nil
+	}
+	return b
 }
 
 type wsConn struct {
 	conn      net.Conn
 	br        *bufio.Reader
 	isClient  bool
+	prelude   []byte // early data decoded from Sec-WebSocket-Protocol
 	readMu    sync.Mutex
 	writeMu   sync.Mutex
 	readBuf   []byte
@@ -131,8 +238,8 @@ type wsConn struct {
 	closeOnce sync.Once
 }
 
-func newWSConn(conn net.Conn, br *bufio.Reader, isClient bool) *wsConn {
-	return &wsConn{conn: conn, br: br, isClient: isClient}
+func newWSConn(conn net.Conn, br *bufio.Reader, isClient bool, prelude []byte) *wsConn {
+	return &wsConn{conn: conn, br: br, isClient: isClient, prelude: prelude}
 }
 
 func (c *wsConn) Read(p []byte) (int, error) {
@@ -142,6 +249,11 @@ func (c *wsConn) Read(p []byte) (int, error) {
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
 	for {
+		if len(c.prelude) > 0 {
+			n := copy(p, c.prelude)
+			c.prelude = c.prelude[n:]
+			return n, nil
+		}
 		if len(c.readBuf) > 0 {
 			n := copy(p, c.readBuf)
 			c.readBuf = c.readBuf[n:]

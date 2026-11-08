@@ -2,6 +2,7 @@ package core
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -205,15 +206,10 @@ func (c *Client) Close() error {
 
 // openVLESS connects to the configured VLESS server and writes the request
 // header. It does not wait for the response header (see relayTCP).
+//
+// Over WebSocket with an early-data limit configured, the request header is
+// sent inside the opening handshake (WS 0-RTT) instead of a separate frame.
 func (c *Client) openVLESS(ctx context.Context, target protocol.Address, command protocol.Command) (*vlessConn, error) {
-	conn, err := transport.Dial(ctx, c.transport, c.server)
-	if err != nil {
-		return nil, err
-	}
-	vc := &vlessConn{conn: conn, br: bufio.NewReader(conn), bw: bufio.NewWriter(conn)}
-	if d := c.cfg.HandshakeTimeout(); d > 0 {
-		_ = conn.SetDeadline(time.Now().Add(d))
-	}
 	h := &protocol.RequestHeader{
 		Version: protocol.Version,
 		UUID:    c.uuid,
@@ -221,13 +217,28 @@ func (c *Client) openVLESS(ctx context.Context, target protocol.Address, command
 		Command: command,
 		Address: target,
 	}
-	if err := protocol.WriteRequestHeader(vc.bw, h); err != nil {
-		_ = conn.Close()
+	var header bytes.Buffer
+	if err := protocol.WriteRequestHeader(&header, h); err != nil {
 		return nil, err
 	}
-	if err := vc.bw.Flush(); err != nil {
-		_ = conn.Close()
+
+	conn, usedEarly, err := transport.DialWithEarlyData(ctx, c.transport, c.server, header.Bytes())
+	if err != nil {
 		return nil, err
+	}
+	vc := &vlessConn{conn: conn, br: bufio.NewReader(conn), bw: bufio.NewWriter(conn)}
+	if d := c.cfg.HandshakeTimeout(); d > 0 {
+		_ = conn.SetDeadline(time.Now().Add(d))
+	}
+	if !usedEarly {
+		if _, err := vc.bw.Write(header.Bytes()); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		if err := vc.bw.Flush(); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
 	}
 	if d := c.cfg.IdleTimeout(); d > 0 {
 		_ = conn.SetDeadline(time.Now().Add(d))

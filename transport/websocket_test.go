@@ -1,9 +1,13 @@
 package transport
 
 import (
+	"bufio"
 	"bytes"
+	"encoding/base64"
+	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"testing"
 	"time"
 )
@@ -12,6 +16,10 @@ import (
 // TCP socket (net.Pipe has no buffering, which would deadlock sequential
 // Write/Read tests).
 func wsPair(t *testing.T, cfg *WSConfig) (*wsConn, *wsConn) {
+	return wsPairWithEarlyData(t, cfg, nil)
+}
+
+func wsPairWithEarlyData(t *testing.T, cfg *WSConfig, early []byte) (*wsConn, *wsConn) {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -38,7 +46,7 @@ func wsPair(t *testing.T, cfg *WSConfig) (*wsConn, *wsConn) {
 		c, err := ServerHandshake(serverRaw, cfg)
 		serverCh <- result{c, err}
 	}()
-	clientConn, clientErr := ClientHandshake(clientRaw, cfg, "example.com:443")
+	clientConn, clientErr := ClientHandshakeWithEarlyData(clientRaw, cfg, "example.com:443", early)
 	sr := <-serverCh
 	if sr.err != nil {
 		t.Fatalf("server handshake: %v", sr.err)
@@ -158,5 +166,185 @@ func TestWebSocketClientFramesAreMasked(t *testing.T) {
 	}
 	if op != wsOpBinary || string(payload) != "x" {
 		t.Fatalf("frame = op %d payload %q", op, payload)
+	}
+}
+
+func TestResolveWSPath(t *testing.T) {
+	cases := []struct {
+		name         string
+		cfg          *WSConfig
+		target, path string
+		ed           int
+	}{
+		{"default", nil, "/", "/", 0},
+		{"relative path", &WSConfig{Path: "ray"}, "/ray", "/ray", 0},
+		{"ed field", &WSConfig{Path: "/ray", Ed: 2048}, "/ray", "/ray", 2048},
+		{"ed query", &WSConfig{Path: "/ray?ed=2048"}, "/ray", "/ray", 2048},
+		{"ed query with params", &WSConfig{Path: "/ray?ed=1024&foo=bar"}, "/ray?foo=bar", "/ray", 1024},
+		{"clamped", &WSConfig{Path: "/ray", Ed: 1 << 30}, "/ray", "/ray", maxEarlyData},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := resolveWSPath(tc.cfg)
+			if got.target != tc.target || got.path != tc.path || got.ed != tc.ed {
+				t.Fatalf("resolveWSPath = %+v, want target=%q path=%q ed=%d", got, tc.target, tc.path, tc.ed)
+			}
+		})
+	}
+}
+
+func TestDecodeEarlyData(t *testing.T) {
+	raw := []byte("VLESS header bytes!")
+	if got := decodeEarlyData(base64.RawURLEncoding.EncodeToString(raw)); !bytes.Equal(got, raw) {
+		t.Fatalf("rawurl early data = %q", got)
+	}
+	// Older V2Ray clients use standard base64 with + / and padding.
+	weird := []byte{0xfb, 0xff, 0xbf, 0x01, 0x00}
+	if got := decodeEarlyData(base64.StdEncoding.EncodeToString(weird)); !bytes.Equal(got, weird) {
+		t.Fatalf("std base64 early data = %x, want %x", got, weird)
+	}
+	for _, bad := range []string{
+		"", "not!base64", "%%%",
+		string(bytes.Repeat([]byte("A"), maxEarlyDataHeader+1)),
+		base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte("x"), maxEarlyData+1)),
+	} {
+		if got := decodeEarlyData(bad); got != nil {
+			t.Fatalf("decodeEarlyData(len=%d) = %d bytes, want nil", len(bad), len(got))
+		}
+	}
+}
+
+func TestWebSocketEarlyDataPrelude(t *testing.T) {
+	cfg := &WSConfig{Path: "/ray", Ed: 2048}
+	early := []byte("VLESS request header plus first payload")
+	client, server := wsPairWithEarlyData(t, cfg, early)
+
+	got := make([]byte, len(early))
+	if _, err := io.ReadFull(server, got); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, early) {
+		t.Fatalf("early data = %q, want %q", got, early)
+	}
+
+	// After the prelude is drained, ordinary frames work in both directions.
+	if _, err := client.Write([]byte("frame")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 5)
+	if _, err := io.ReadFull(server, buf); err != nil {
+		t.Fatal(err)
+	}
+	if string(buf) != "frame" {
+		t.Fatalf("after early data, frame = %q", buf)
+	}
+	if _, err := server.Write([]byte("reply")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(client, buf); err != nil {
+		t.Fatal(err)
+	}
+	if string(buf) != "reply" {
+		t.Fatalf("downlink = %q", buf)
+	}
+}
+
+func TestWebSocketServerEarlyDataEcho(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	clientRaw, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientRaw.Close()
+	serverRaw, err := ln.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = clientRaw.SetDeadline(time.Now().Add(10 * time.Second))
+	_ = serverRaw.SetDeadline(time.Now().Add(10 * time.Second))
+
+	type result struct {
+		c   net.Conn
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		c, err := ServerHandshake(serverRaw, &WSConfig{Path: "/ray"})
+		ch <- result{c, err}
+	}()
+
+	early := []byte{0xfb, 0xff, 0xbf, 0x01, 0x00}
+	proto := base64.StdEncoding.EncodeToString(early)
+	fmt.Fprintf(clientRaw, "GET /ray HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: %s\r\n\r\n", proto)
+
+	resp, err := http.ReadResponse(bufio.NewReader(clientRaw), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("status = %s", resp.Status)
+	}
+	if got := resp.Header.Get("Sec-WebSocket-Protocol"); got != proto {
+		t.Fatalf("echoed subprotocol = %q, want %q", got, proto)
+	}
+	r := <-ch
+	if r.err != nil {
+		t.Fatalf("server handshake: %v", r.err)
+	}
+	defer r.c.Close()
+	got := make([]byte, len(early))
+	if _, err := io.ReadFull(r.c, got); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, early) {
+		t.Fatalf("prelude = %x, want %x", got, early)
+	}
+}
+
+// TestClientHandshakeSendsEarlyDataHeader inspects the actual bytes on the
+// wire, so a regression that silently falls back to a normal handshake
+// cannot make the end-to-end 0-RTT tests pass falsely.
+func TestClientHandshakeSendsEarlyDataHeader(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	captured := make(chan string, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			captured <- ""
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+		req, err := http.ReadRequest(bufio.NewReader(conn))
+		if err != nil {
+			captured <- ""
+			return
+		}
+		captured <- req.Header.Get("Sec-WebSocket-Protocol")
+		_, _ = conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+	}()
+
+	raw, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	early := []byte("VLESS request header bytes")
+	// The handshake intentionally fails (400); only the request bytes matter.
+	_, _ = ClientHandshakeWithEarlyData(raw, &WSConfig{Path: "/ray?ed=2048"}, "example.com:443", early)
+
+	proto := <-captured
+	want := base64.RawURLEncoding.EncodeToString(early)
+	if proto != want {
+		t.Fatalf("Sec-WebSocket-Protocol = %q, want %q", proto, want)
 	}
 }

@@ -13,7 +13,7 @@ import (
 	"vless-core/protocol"
 )
 
-const version = "0.1.0"
+const version = "0.1.1"
 
 type service interface {
 	Serve() error

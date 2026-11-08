@@ -30,8 +30,9 @@ type TLSConfig struct {
 }
 
 type WSConfig struct {
-	Path string `json:"path,omitempty"` // default "/"
+	Path string `json:"path,omitempty"` // default "/"; may carry "?ed=N" like Xray
 	Host string `json:"host,omitempty"` // default: dial address
+	Ed   int    `json:"ed,omitempty"`   // client-side WS 0-RTT limit in bytes, 0 disables
 }
 
 func (c *Config) orDefault() *Config {
@@ -51,44 +52,60 @@ func (c *Config) useTLS() bool {
 
 // Dial opens a connection to a VLESS server, applying TLS and/or WebSocket.
 func Dial(ctx context.Context, cfg *Config, address string) (net.Conn, error) {
+	conn, _, err := DialWithEarlyData(ctx, cfg, address, nil)
+	return conn, err
+}
+
+// DialWithEarlyData is Dial with optional WebSocket 0-RTT. When the transport
+// is WebSocket and the configured early-data limit permits it, earlyData is
+// carried inside the opening handshake and used is true. In that case the
+// caller MUST NOT write earlyData again: the server already has those bytes.
+func DialWithEarlyData(ctx context.Context, cfg *Config, address string, earlyData []byte) (net.Conn, bool, error) {
 	cfg = cfg.orDefault()
 	d := &net.Dialer{}
 	conn, err := d.DialContext(ctx, "tcp", address)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	ok := false
 	defer func() {
-		if !ok {
-			conn.Close()
+		if !ok && conn != nil {
+			_ = conn.Close()
 		}
 	}()
 
 	if cfg.useTLS() {
 		tc, err := clientTLSConfig(cfg.TLS, address)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		tlsConn := tls.Client(conn, tc)
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
-			return nil, fmt.Errorf("tls handshake: %w", err)
+			return nil, false, fmt.Errorf("tls handshake: %w", err)
 		}
 		conn = tlsConn
 	}
 
+	used := false
 	if cfg.useWS() {
 		ws := cfg.WS
 		if ws == nil {
 			ws = &WSConfig{}
 		}
-		conn, err = ClientHandshake(conn, ws, address)
+		limit := resolveWSPath(ws).ed
+		used = limit > 0 && len(earlyData) > 0 && len(earlyData) <= limit
+		if used {
+			conn, err = ClientHandshakeWithEarlyData(conn, ws, address, earlyData)
+		} else {
+			conn, err = ClientHandshake(conn, ws, address)
+		}
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 	}
 
 	ok = true
-	return conn, nil
+	return conn, used, nil
 }
 
 func clientTLSConfig(c *TLSConfig, address string) (*tls.Config, error) {

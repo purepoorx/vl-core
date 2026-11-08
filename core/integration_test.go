@@ -311,6 +311,50 @@ func TestEndToEndWebSocketTLS(t *testing.T) {
 	echoCheck(t, conn, "hello-vless-over-wss")
 }
 
+func TestEndToEndWebSocketEarlyData(t *testing.T) {
+	cases := []struct {
+		name         string
+		srvWS, cliWS *transport.WSConfig
+	}{
+		{
+			name:  "ed field",
+			srvWS: &transport.WSConfig{Path: "/ray"},
+			cliWS: &transport.WSConfig{Path: "/ray", Ed: 2048},
+		},
+		{
+			name:  "xray style ed query",
+			srvWS: &transport.WSConfig{Path: "/ray?ed=2048"},
+			cliWS: &transport.WSConfig{Path: "/ray?ed=2048"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			target := startTCPEcho(t)
+			host, port := splitHostPort(t, target)
+			cli, _ := startPair(t, "socks5",
+				&transport.Config{Network: "ws", WS: tc.srvWS},
+				&transport.Config{Network: "ws", WS: tc.cliWS})
+			conn := socksConnect(t, cli.Addr().String(), host, port)
+			defer conn.Close()
+			echoCheck(t, conn, "hello-vless-over-ws-0rtt")
+			echoCheck(t, conn, "second-frame-after-early-header")
+		})
+	}
+}
+
+func TestEndToEndWebSocketEarlyDataUDP(t *testing.T) {
+	target := startUDPEcho(t)
+	host, port := splitHostPort(t, target)
+	cli, _ := startPair(t, "socks5",
+		&transport.Config{Network: "ws", WS: &transport.WSConfig{Path: "/ray"}},
+		&transport.Config{Network: "ws", WS: &transport.WSConfig{Path: "/ray", Ed: 2048}})
+	payload := []byte("udp-over-ws-0rtt")
+	got := socksUDPExchange(t, cli.Addr().String(), host, port, payload)
+	if string(got) != string(payload) {
+		t.Fatalf("udp echo = %x, want %x", got, payload)
+	}
+}
+
 // socksUDPExchange performs one SOCKS5 UDP ASSOCIATE exchange through proxy
 // and returns the datagram payload of the first reply (SOCKS header stripped).
 func socksUDPExchange(t *testing.T, proxy, host string, port uint16, payload []byte) []byte {
