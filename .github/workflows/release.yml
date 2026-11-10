@@ -102,6 +102,12 @@ jobs:
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG already exists, replacing assets"
             gh release upload "$TAG" dist/* --clobber
+            # Deleting a tag turns its release into a draft. Assets alone would
+            # then be invisible to everyone, so publish it again if needed.
+            if [ "$(gh release view "$TAG" --json isDraft -q .isDraft)" = "true" ]; then
+              echo "Release $TAG was a draft, publishing it"
+              gh release edit "$TAG" --draft=false
+            fi
           else
             gh release create "$TAG" dist/* \
               --title "vl-core $TAG" \
