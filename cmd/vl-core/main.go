@@ -13,7 +13,7 @@ import (
 	"github.com/purepoorx/vl-core/protocol"
 )
 
-const version = "0.1.2"
+const version = "0.1.3"
 
 type service interface {
 	Serve() error

@@ -187,7 +187,7 @@ func (s *Server) handle(conn net.Conn) {
 	if d := s.cfg.IdleTimeout(); d > 0 {
 		_ = target.SetDeadline(time.Now().Add(d))
 	}
-	if err := relayStreams(conn, br, bw, target); err != nil {
+	if err := relayStreams(conn, br, bw, target, s.cfg.HalfCloseTimeout()); err != nil {
 		s.log.Debug("tcp session %s ended: %v", conn.RemoteAddr(), err)
 	}
 }

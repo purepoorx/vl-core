@@ -49,6 +49,11 @@ type TimeoutConfig struct {
 	Handshake int `json:"handshake,omitempty"` // seconds, default 15
 	Idle      int `json:"idle,omitempty"`      // seconds, 0 = no limit
 	UDPIdle   int `json:"udpIdle,omitempty"`   // seconds, default 60
+	// HalfClose bounds how long a session may wait after one direction has
+	// finished over a transport that cannot signal EOF (WebSocket). The
+	// countdown restarts on every byte received, so only a fully silent peer is
+	// reaped. Seconds, default 60; a negative value disables the guard.
+	HalfClose int `json:"halfClose,omitempty"`
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -125,4 +130,18 @@ func (c *Config) UDPIdleTimeout() time.Duration {
 		return 60 * time.Second
 	}
 	return time.Duration(c.Timeouts.UDPIdle) * time.Second
+}
+
+// HalfCloseTimeout returns how long a session may sit idle after one direction
+// finished over a transport that cannot propagate a half-close. Zero means "use
+// the default", a negative value disables the guard entirely.
+func (c *Config) HalfCloseTimeout() time.Duration {
+	switch {
+	case c.Timeouts.HalfClose < 0:
+		return 0
+	case c.Timeouts.HalfClose == 0:
+		return 60 * time.Second
+	default:
+		return time.Duration(c.Timeouts.HalfClose) * time.Second
+	}
 }

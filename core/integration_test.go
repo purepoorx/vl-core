@@ -42,11 +42,18 @@ func waitAddr(t *testing.T, f func() net.Addr) net.Addr {
 // startPair brings up a VLESS server and a local SOCKS5/HTTP client.
 func startPair(t *testing.T, inbound string, srvTr, cliTr *transport.Config) (*Client, *Server) {
 	t.Helper()
+	return startPairTimeout(t, inbound, srvTr, cliTr, TimeoutConfig{})
+}
+
+// startPairTimeout is startPair with explicit timeouts on both ends.
+func startPairTimeout(t *testing.T, inbound string, srvTr, cliTr *transport.Config, to TimeoutConfig) (*Client, *Server) {
+	t.Helper()
 	srv, err := NewServer(&Config{
 		Role:      "server",
 		Listen:    "127.0.0.1:0",
 		Users:     []UserConfig{{ID: itestUUID, Email: "tester"}},
 		Transport: srvTr,
+		Timeouts:  to,
 	}, testLogger())
 	if err != nil {
 		t.Fatal(err)
@@ -55,10 +62,11 @@ func startPair(t *testing.T, inbound string, srvTr, cliTr *transport.Config) (*C
 	srvAddr := waitAddr(t, srv.Addr)
 
 	cli, err := NewClient(&Config{
-		Role:    "client",
-		Listen:  "127.0.0.1:0",
-		Inbound: inbound,
-		Server:  &ServerConfig{Address: srvAddr.String(), ID: itestUUID, Transport: cliTr},
+		Role:     "client",
+		Listen:   "127.0.0.1:0",
+		Inbound:  inbound,
+		Timeouts: to,
+		Server:   &ServerConfig{Address: srvAddr.String(), ID: itestUUID, Transport: cliTr},
 	}, testLogger())
 	if err != nil {
 		t.Fatal(err)

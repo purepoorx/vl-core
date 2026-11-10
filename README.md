@@ -153,6 +153,21 @@ UDP 用 `protocol.WritePacket` / `protocol.ReadPacket`；`protocol.MarshalAddons
 
 ---
 
+## 超时与清理
+
+配置里的 `timeouts`，单位都是秒：
+
+| 字段 | 默认 | 作用 |
+|---|---|---|
+| `handshake` | 15 | 握手阶段的总 deadline |
+| `idle` | 0（不限） | 流式会话的空闲 deadline |
+| `udpIdle` | 60 | UDP 会话无包即回收，每次收发成功顺延 |
+| `halfClose` | 60 | 半关闭后对端完全静默的兜底，每读到数据顺延；负数表示关闭该兜底 |
+
+`halfClose` 只对**无法传播 TCP 半关闭的传输**（WebSocket / WSS）生效，语义见下面能力边界。
+
+---
+
 ## 能力边界（重要）
 
 | 已实现 | 未实现 |
@@ -165,7 +180,8 @@ UDP 用 `protocol.WritePacket` / `protocol.ReadPacket`；`protocol.MarshalAddons
 | raw TCP / TLS / WebSocket / WSS | gRPC、QUIC、HTTP/2、mkcp 等传输 |
 | SOCKS5（CONNECT + UDP ASSOCIATE）、HTTP CONNECT | 路由、策略、流量统计、DNS 内部解析、UDP full-cone |
 | 多用户、握手/会话超时、完整测试 | TLS 1.3 0-RTT、XHTTP H2/H3 |
-| WebSocket 0-RTT（`?ed=N` / `ed`，双向互通官方 Xray） | — |
+| WebSocket 0-RTT（`?ed=N` / `ed`，双向互通官方 Xray） | **WS/WSS 传播 TCP 半关闭**（RFC 6455 无此原语） |
+| WS 半关闭兜底（`timeouts.halfClose`，默认 60s） | — |
 
 **关键限制**：`Addons.Flow` 可以正确编解码（例如 `xtls-rprx-vision`），但**数据面按普通字节流透传**，没有实现 Vision 的 TLS 握手识别与填充逻辑。因此只能对接 **`flow` 留空** 的官方 Xray 节点；如果服务端用户配置了 `flow: "xtls-rprx-vision"`，官方 Xray 会要求客户端配合 Vision，本项目无法互通。REALITY 节点同理不支持。要连这类节点请直接用官方 Xray。
 
@@ -178,6 +194,7 @@ UDP 用 `protocol.WritePacket` / `protocol.ReadPacket`；`protocol.MarshalAddons
 - UDP 采用「每个目标一条 VLESS 连接」，覆盖 DNS 等常见场景，但不做 XUDP 多路复用。
 - 每个 SOCKS5 UDP ASSOCIATE 都有自己的 UDP relay socket（端口唯一），并绑定首个合法来源地址，同机多个客户端不会互相读到回包。
 - TCP 用会话级 deadline 兜底（`timeouts.idle`，默认不限）；UDP 可能长时间无包，默认 `timeouts.udpIdle=60` 秒回收会话，有流量则顺延。
+- **WS/WSS 不支持 TCP 半关闭**。RFC 6455 只有「整个连接关闭」的 Close 帧，没有「我不再发了」的原语，把 `CloseWrite` 映射成 Close 帧会连带掐掉反向数据。因此依赖 FIN 判定结束的协议（FTP 数据连接、HTTP/1.0 无 `Content-Length` 的响应、`nc -N` 之类的管道）在 WS 下拿不到结束信号 —— 这类场景请改用 raw TCP 或 TLS（`*tls.Conn` 实现了 `CloseWrite`）。为避免永久挂起，WS 下单向结束后由 `timeouts.halfClose`（默认 60s，持续有数据则顺延）兜底收尾，官方 Xray 的 WS 传输同样没有半关闭能力。
 
 ---
 
@@ -191,7 +208,7 @@ go test ./...
 
 - `protocol/`：UUID、Addons wire format（含与 `proto.Marshal` 一致的黄金字节、未知字段按 varint/fixed32/fixed64/length-delimited 各 wire type 跳过并保真）、IPv4/IPv6/域名地址 round-trip、**与官方 `EncodeRequestHeader` 等价的请求头黄金向量**、Vision/Mux/Rvs 头、用户校验与路由字节、各类畸形输入、响应头、UDP 分包。
 - `transport/`：WebSocket 握手、客户端掩码、大包与部分读、分片消息、ping/pong，以及协议违规拒绝（控制帧 >125 字节、分片控制帧、未掩码客户端帧、RSV 位、非法 close 状态码）。
-- `core/`：端到端 TCP echo、HTTP CONNECT、TLS、WebSocket、WSS、SOCKS5 UDP ASSOCIATE、未知 UUID 拒绝，WS 0-RTT 的 TCP / UDP 链路，**同机两个 UDP ASSOCIATE 互不串流**，以及服务端 UDP 会话按 `udpIdle` 回收。
+- `core/`：端到端 TCP echo、HTTP CONNECT、TLS、WebSocket、WSS、SOCKS5 UDP ASSOCIATE、未知 UUID 拒绝，WS 0-RTT 的 TCP / UDP 链路，**同机两个 UDP ASSOCIATE 互不串流**，服务端 UDP 会话按 `udpIdle` 回收，以及 raw TCP 正常传播半关闭 / WS 下由 `halfClose` 兜底收尾。
 - `core/xray_interop_test.go`（env-gated，`VL_CORE_XRAY_BIN`）：与官方 Xray 的 8 组交叉互通，含 `?ed=2048` 0-RTT 双向。CI 里有独立的 `interop` job 自动跑这一组。
 
 ---

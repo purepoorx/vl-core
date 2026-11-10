@@ -211,10 +211,16 @@ func (c *Client) openVLESS(ctx context.Context, target protocol.Address, command
 
 // relayTCP connects a local inbound stream to a VLESS TCP connection.
 func (c *Client) relayTCP(local net.Conn, localR io.Reader, vc *vlessConn) error {
+	guard := newHalfCloseGuard(vc.conn, c.cfg.HalfCloseTimeout())
 	errCh := make(chan error, 2)
 	go func() {
 		err := copyAndFlush(vc.bw, localR)
-		tryCloseWrite(vc.conn)
+		// The local side is done. Over WebSocket the server cannot be told, so
+		// it would keep waiting for more uplink data while we wait for its
+		// response; bound that wait instead of hanging forever.
+		if err == nil && !tryCloseWrite(vc.conn) {
+			guard.arm()
+		}
 		errCh <- err
 	}()
 	go func() {
@@ -222,11 +228,13 @@ func (c *Client) relayTCP(local net.Conn, localR io.Reader, vc *vlessConn) error
 			// Fatal (bad UUID, wrong server, ...): unblock the uplink too.
 			_ = vc.conn.Close()
 			_ = local.Close()
+			guard.stop()
 			errCh <- err
 			return
 		}
-		_, err := io.Copy(local, vc.br)
+		_, err := io.Copy(local, touchReader{r: vc.br, g: guard})
 		tryCloseWrite(local)
+		guard.stop()
 		errCh <- err
 	}()
 	first, second := <-errCh, <-errCh
