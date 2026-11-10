@@ -349,6 +349,26 @@ func (c *wsConn) readFrame() (bool, byte, []byte, error) {
 	op := head[0] & 0x0f
 	masked := head[1]&0x80 != 0
 	length := uint64(head[1] & 0x7f)
+
+	// No extension was negotiated, so RSV1..3 must be clear (RFC 6455 §5.2).
+	if head[0]&0x70 != 0 {
+		return false, 0, nil, errors.New("websocket: reserved bits must be zero")
+	}
+	// RFC 6455 §5.5: control frames are never fragmented and carry at most 125
+	// bytes of payload, which also rules out the 16/64-bit length forms (the
+	// 7-bit field then reads 126 or 127).
+	if op&0x8 != 0 && (!fin || length > 125) {
+		return false, 0, nil, errors.New("websocket: invalid control frame")
+	}
+	// RFC 6455 §5.1: every client-to-server frame must be masked, and
+	// server-to-client frames must not be.
+	if !c.isClient && !masked {
+		return false, 0, nil, errors.New("websocket: client frame is not masked")
+	}
+	if c.isClient && masked {
+		return false, 0, nil, errors.New("websocket: server frame must not be masked")
+	}
+
 	switch length {
 	case 126:
 		var b [2]byte
@@ -382,7 +402,33 @@ func (c *wsConn) readFrame() (bool, byte, []byte, error) {
 	for i := range payload {
 		payload[i] ^= mask[i%4]
 	}
+	if op == wsOpClose {
+		if err := validateClosePayload(payload); err != nil {
+			return false, 0, nil, err
+		}
+	}
 	return fin, op, payload, nil
+}
+
+// validateClosePayload enforces RFC 6455 §5.5.1: a close body is either empty
+// or a 2-byte status code followed by an optional UTF-8 reason.
+func validateClosePayload(p []byte) error {
+	if len(p) == 0 {
+		return nil
+	}
+	if len(p) == 1 {
+		return errors.New("websocket: close payload of 1 byte")
+	}
+	code := binary.BigEndian.Uint16(p[:2])
+	switch {
+	case code >= 3000 && code <= 4999: // registered for libraries/applications
+		return nil
+	case code == 1000, code == 1001, code == 1002, code == 1003,
+		code == 1007, code == 1008, code == 1009, code == 1010,
+		code == 1011, code == 1012, code == 1013, code == 1014:
+		return nil
+	}
+	return fmt.Errorf("websocket: invalid close status code %d", code)
 }
 
 func (c *wsConn) writeFrame(op byte, payload []byte) error {

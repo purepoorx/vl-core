@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"strings"
 
-	"vless-core/protocol"
+	"github.com/purepoorx/vl-core/protocol"
 )
 
 // handleHTTP implements the HTTP CONNECT proxy method. Plain HTTP requests

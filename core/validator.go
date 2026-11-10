@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"sync"
 
-	"vless-core/protocol"
+	"github.com/purepoorx/vl-core/protocol"
 )
 
 // Validator implements protocol.Validator with a concurrent UUID -> user map.

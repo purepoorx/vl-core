@@ -169,6 +169,147 @@ func TestWebSocketClientFramesAreMasked(t *testing.T) {
 	}
 }
 
+// writeRawFrame injects bytes the encoder would never produce, so the framing
+// rules can be tested against a hostile peer.
+func writeRawFrame(t *testing.T, conn net.Conn, b0 byte, rest ...[]byte) {
+	t.Helper()
+	buf := []byte{b0}
+	for _, p := range rest {
+		buf = append(buf, p...)
+	}
+	if _, err := conn.Write(buf); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// writeMaskedFrame sends a correctly masked short frame from the client role.
+func writeMaskedFrame(t *testing.T, conn net.Conn, op byte, payload []byte) {
+	t.Helper()
+	if len(payload) > 125 {
+		t.Fatalf("writeMaskedFrame only supports short frames, got %d", len(payload))
+	}
+	mask := [4]byte{0x11, 0x22, 0x33, 0x44}
+	buf := []byte{0x80 | op, 0x80 | byte(len(payload))}
+	buf = append(buf, mask[:]...)
+	for i := range payload {
+		buf = append(buf, payload[i]^mask[i%4])
+	}
+	if _, err := conn.Write(buf); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWebSocketRejectsOversizedControlFrame(t *testing.T) {
+	client, server := wsPair(t, nil)
+	// FIN + ping with the 7-bit length set to 126: a control frame must never
+	// use the extended length form (RFC 6455 §5.5). Only the header is needed,
+	// because the reader must reject it before consuming a payload.
+	writeRawFrame(t, client.conn, 0x89, []byte{126})
+	if _, err := server.Read(make([]byte, 16)); err == nil {
+		t.Fatal("server accepted a control frame longer than 125 bytes")
+	}
+}
+
+func TestWebSocketRejectsFragmentedControlFrame(t *testing.T) {
+	client, server := wsPair(t, nil)
+	// Missing FIN on a ping.
+	writeRawFrame(t, client.conn, 0x09, []byte{0x81, 0, 0, 0, 0})
+	if _, err := server.Read(make([]byte, 16)); err == nil {
+		t.Fatal("server accepted a fragmented control frame")
+	}
+}
+
+func TestWebSocketRejectsUnmaskedClientFrame(t *testing.T) {
+	client, server := wsPair(t, nil)
+	// FIN + binary, length 1, no MASK bit, payload "x".
+	writeRawFrame(t, client.conn, 0x82, []byte{0x01, 'x'})
+	if _, err := server.Read(make([]byte, 16)); err == nil {
+		t.Fatal("server accepted an unmasked client frame")
+	}
+}
+
+func TestWebSocketRejectsReservedBits(t *testing.T) {
+	client, server := wsPair(t, nil)
+	// FIN + RSV1 + binary, masked, length 1.
+	writeRawFrame(t, client.conn, 0xc2, []byte{0x81, 1, 2, 3, 4, 'x' ^ 1})
+	if _, err := server.Read(make([]byte, 16)); err == nil {
+		t.Fatal("server accepted a frame with RSV1 set")
+	}
+}
+
+func TestWebSocketRejectsBadClosePayloads(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload []byte
+	}{
+		{"single byte", []byte{0x03}},
+		{"reserved code 1005", []byte{0x03, 0xed}},
+		{"reserved code 1006", []byte{0x03, 0xee}},
+		{"out of range 2999", []byte{0x0b, 0xb7}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client, server := wsPair(t, nil)
+			writeMaskedFrame(t, client.conn, wsOpClose, tc.payload)
+			if _, err := server.Read(make([]byte, 16)); err == nil {
+				t.Fatalf("server accepted close payload %x", tc.payload)
+			}
+		})
+	}
+}
+
+func TestWebSocketAcceptsValidCloseFrame(t *testing.T) {
+	client, server := wsPair(t, nil)
+	writeMaskedFrame(t, client.conn, wsOpClose, []byte{0x03, 0xe8, 'b', 'y', 'e'}) // 1000 + reason
+	if _, err := server.Read(make([]byte, 16)); err != io.EOF {
+		t.Fatalf("Read after close = %v, want io.EOF", err)
+	}
+}
+
+func TestValidateClosePayload(t *testing.T) {
+	ok := [][]byte{
+		nil,
+		{0x03, 0xe8},           // 1000
+		{0x03, 0xf3},           // 1011
+		{0x0b, 0xb8},           // 3000
+		{0x13, 0x87},           // 4999
+		{0x03, 0xe8, 'o', 'k'}, // 1000 with reason
+	}
+	for _, p := range ok {
+		if err := validateClosePayload(p); err != nil {
+			t.Fatalf("validateClosePayload(%x) = %v, want nil", p, err)
+		}
+	}
+	bad := [][]byte{
+		{0x03},
+		{0x03, 0xed}, // 1005
+		{0x03, 0xee}, // 1006
+		{0x03, 0xf7}, // 1015
+		{0x00, 0x00}, // 0
+		{0x0b, 0xb7}, // 2999
+	}
+	for _, p := range bad {
+		if err := validateClosePayload(p); err == nil {
+			t.Fatalf("validateClosePayload(%x) = nil, want error", p)
+		}
+	}
+}
+
+func TestWebSocketAcceptsMaxSizeControlFrame(t *testing.T) {
+	client, server := wsPair(t, nil)
+	writeMaskedFrame(t, client.conn, wsOpPing, bytes.Repeat([]byte("p"), 125))
+	if _, err := client.Write([]byte("still-alive")); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, 11)
+	if _, err := io.ReadFull(server, got); err != nil {
+		t.Fatalf("ping of exactly 125 bytes was rejected: %v", err)
+	}
+	if string(got) != "still-alive" {
+		t.Fatalf("after max ping = %q", got)
+	}
+}
+
 func TestResolveWSPath(t *testing.T) {
 	cases := []struct {
 		name         string

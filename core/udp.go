@@ -10,14 +10,21 @@ import (
 	"sync"
 	"time"
 
-	"vless-core/protocol"
+	"github.com/purepoorx/vl-core/protocol"
 )
 
-// udpAssociate represents one SOCKS5 UDP ASSOCIATE control connection.
+// udpAssociate represents one SOCKS5 UDP ASSOCIATE session.
+//
+// RFC 1928 ties an association to its control TCP connection, not to the client
+// IP. Each association therefore owns a dedicated relay socket with its own
+// advertised port, and is pinned to the first client address that sends a valid
+// datagram. Two clients on the same host can no longer read each other's
+// replies, which a shared socket keyed by client IP allowed.
+//
 // Each distinct destination gets its own VLESS UDP connection (tunnel).
 type udpAssociate struct {
 	client     *Client
-	key        string
+	relay      *net.UDPConn
 	mu         sync.Mutex
 	clientAddr *net.UDPAddr
 	tunnels    map[string]*udpTunnel
@@ -36,33 +43,55 @@ type udpTunnel struct {
 	closeOnce sync.Once
 }
 
-func (c *Client) newAssociate(key string) *udpAssociate {
+// listenRelaySocket binds a dedicated UDP socket for a single association.
+// It reuses the local IP of the control connection so the advertised address
+// is reachable by the client, and lets the kernel choose an ephemeral port.
+func listenRelaySocket(local net.Conn) (*net.UDPConn, error) {
+	ip := net.IPv4(127, 0, 0, 1)
+	if ta, ok := local.LocalAddr().(*net.TCPAddr); ok && ta.IP != nil {
+		ip = ta.IP
+	}
+	return net.ListenUDP("udp", &net.UDPAddr{IP: ip})
+}
+
+func (c *Client) newAssociate(relay *net.UDPConn) *udpAssociate {
 	a := &udpAssociate{
 		client:  c,
-		key:     key,
+		relay:   relay,
 		tunnels: make(map[string]*udpTunnel),
 		done:    make(chan struct{}),
 	}
 	c.mu.Lock()
-	c.associates[key] = a
+	if c.closed {
+		c.mu.Unlock()
+		a.close()
+		return nil
+	}
+	c.associates[a] = struct{}{}
 	c.mu.Unlock()
+	go a.serveRelay()
 	go a.reapLoop()
 	return a
 }
 
 func (c *Client) removeAssociate(a *udpAssociate) {
 	c.mu.Lock()
-	if c.associates[a.key] == a {
-		delete(c.associates, a.key)
-	}
+	delete(c.associates, a)
 	c.mu.Unlock()
 	a.close()
 }
 
-func (c *Client) findAssociate(ip string) *udpAssociate {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.associates[ip]
+// serveRelay reads datagrams addressed to this association's relay port.
+func (a *udpAssociate) serveRelay() {
+	buf := make([]byte, 65535)
+	for {
+		n, src, err := a.relay.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+		pkt := append([]byte(nil), buf[:n]...)
+		go a.handlePacket(src, pkt)
+	}
 }
 
 func (a *udpAssociate) reapLoop() {
@@ -92,6 +121,9 @@ func (a *udpAssociate) reapLoop() {
 func (a *udpAssociate) close() {
 	a.closeOnce.Do(func() {
 		close(a.done)
+		if a.relay != nil {
+			_ = a.relay.Close()
+		}
 		a.mu.Lock()
 		for _, t := range a.tunnels {
 			t.close()
@@ -147,11 +179,8 @@ func (t *udpTunnel) readLoop() {
 		if err != nil {
 			continue
 		}
-		a.client.mu.Lock()
-		udpConn := a.client.udpConn
-		a.client.mu.Unlock()
-		if udpConn != nil {
-			_, _ = udpConn.WriteToUDP(reply, src)
+		if _, err := a.relay.WriteToUDP(reply, src); err != nil {
+			return
 		}
 	}
 }
@@ -189,45 +218,44 @@ func (a *udpAssociate) getTunnel(addr protocol.Address) (*udpTunnel, error) {
 	return t, nil
 }
 
-func (c *Client) serveSocksUDP(conn *net.UDPConn) {
-	buf := make([]byte, 65535)
-	for {
-		n, src, err := conn.ReadFromUDP(buf)
-		if err != nil {
-			return
-		}
-		pkt := append([]byte(nil), buf[:n]...)
-		go c.handleSocksUDPPacket(src, pkt)
-	}
-}
-
-func (c *Client) handleSocksUDPPacket(src *net.UDPAddr, p []byte) {
-	a := c.findAssociate(src.IP.String())
-	if a == nil {
-		return
-	}
-	a.mu.Lock()
-	if a.clientAddr == nil {
-		a.clientAddr = src
-	}
-	a.mu.Unlock()
-
+// handlePacket validates one datagram received on the association's relay port.
+// The first valid sender becomes the association's client address; datagrams
+// from any other source are dropped so a stray or spoofed packet cannot inject
+// traffic into the session.
+func (a *udpAssociate) handlePacket(src *net.UDPAddr, p []byte) {
 	addr, data, err := parseSocksUDPPayload(p)
 	if err != nil {
-		c.log.Debug("bad socks udp packet from %s: %v", src, err)
+		a.client.log.Debug("bad socks udp packet from %s: %v", src, err)
+		return
+	}
+
+	a.mu.Lock()
+	if a.clientAddr == nil {
+		bound := *src
+		a.clientAddr = &bound
+	}
+	bound := a.clientAddr
+	a.mu.Unlock()
+	if !sameUDPAddr(bound, src) {
+		a.client.log.Debug("socks udp packet from unexpected source %s (bound to %s)", src, bound)
 		return
 	}
 	if len(data) == 0 {
 		return
 	}
+
 	t, err := a.getTunnel(addr)
 	if err != nil {
-		c.log.Warn("udp tunnel to %s failed: %v", addr.String(), err)
+		a.client.log.Warn("udp tunnel to %s failed: %v", addr.String(), err)
 		return
 	}
 	if err := t.writePacket(data); err != nil {
-		c.log.Debug("udp write %s: %v", addr.String(), err)
+		a.client.log.Debug("udp write %s: %v", addr.String(), err)
 	}
+}
+
+func sameUDPAddr(a, b *net.UDPAddr) bool {
+	return a != nil && b != nil && a.Port == b.Port && a.IP.Equal(b.IP)
 }
 
 // parseSocksUDPPayload decodes the SOCKS5 UDP request header:

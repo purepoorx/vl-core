@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"vless-core/transport"
+	"github.com/purepoorx/vl-core/transport"
 )
 
 // Config is the single JSON configuration file for both roles.

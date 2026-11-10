@@ -132,7 +132,7 @@ xray run -c examples/xray-client.json
 ## 作为协议库使用
 
 ```go
-import "vless-core/protocol"
+import "github.com/purepoorx/vl-core/protocol"
 
 // 编码
 h := &protocol.RequestHeader{
@@ -149,7 +149,7 @@ req, err := protocol.ReadRequestHeader(reader, v)
 fmt.Println(req.Command, req.Address.String(), req.Addons.Flow)
 ```
 
-UDP 用 `protocol.WritePacket` / `protocol.ReadPacket`；`protocol.MarshalAddons` / `UnmarshalAddons` 单独可用来处理 `xtls-rprx-vision` 等 Flow 字段。module 名 `vless-core` 可按需要改。
+UDP 用 `protocol.WritePacket` / `protocol.ReadPacket`；`protocol.MarshalAddons` / `UnmarshalAddons` 单独可用来处理 `xtls-rprx-vision` 等 Flow 字段。module path 是 `github.com/purepoorx/vl-core`，可以直接 `go get` 后按上面的 import 使用。
 
 ---
 
@@ -176,7 +176,8 @@ UDP 用 `protocol.WritePacket` / `protocol.ReadPacket`；`protocol.MarshalAddons
 - 官方把响应头与首个下行包合并 flush 做性能优化；本项目**立即 flush 响应头**，语义等价且更不易踩坑。
 - 客户端**上行不等待响应头**（两个方向并发启动），避免与延迟 flush 的服务端实现死锁。
 - UDP 采用「每个目标一条 VLESS 连接」，覆盖 DNS 等常见场景，但不做 XUDP 多路复用。
-- 用会话级 deadline 兜底，不做精细的 idle 心跳管理。
+- 每个 SOCKS5 UDP ASSOCIATE 都有自己的 UDP relay socket（端口唯一），并绑定首个合法来源地址，同机多个客户端不会互相读到回包。
+- TCP 用会话级 deadline 兜底（`timeouts.idle`，默认不限）；UDP 可能长时间无包，默认 `timeouts.udpIdle=60` 秒回收会话，有流量则顺延。
 
 ---
 
@@ -188,10 +189,10 @@ go test ./...
 
 覆盖内容：
 
-- `protocol/`：UUID、Addons wire format（含与 `proto.Marshal` 一致的黄金字节）、IPv4/IPv6/域名地址 round-trip、**与官方 `EncodeRequestHeader` 等价的请求头黄金向量**、Vision/Mux/Rvs 头、用户校验与路由字节、各类畸形输入、响应头、UDP 分包。
-- `transport/`：WebSocket 握手、客户端掩码、大包与部分读、分片消息、ping/pong。
-- `core/`：端到端 TCP echo、HTTP CONNECT、TLS、WebSocket、WSS、SOCKS5 UDP ASSOCIATE、未知 UUID 拒绝，以及 WS 0-RTT 的 TCP / UDP 链路。
-- `core/xray_interop_test.go`（env-gated，`VL_CORE_XRAY_BIN`）：与官方 Xray 的 8 组交叉互通，含 `?ed=2048` 0-RTT 双向。
+- `protocol/`：UUID、Addons wire format（含与 `proto.Marshal` 一致的黄金字节、未知字段按 varint/fixed32/fixed64/length-delimited 各 wire type 跳过并保真）、IPv4/IPv6/域名地址 round-trip、**与官方 `EncodeRequestHeader` 等价的请求头黄金向量**、Vision/Mux/Rvs 头、用户校验与路由字节、各类畸形输入、响应头、UDP 分包。
+- `transport/`：WebSocket 握手、客户端掩码、大包与部分读、分片消息、ping/pong，以及协议违规拒绝（控制帧 >125 字节、分片控制帧、未掩码客户端帧、RSV 位、非法 close 状态码）。
+- `core/`：端到端 TCP echo、HTTP CONNECT、TLS、WebSocket、WSS、SOCKS5 UDP ASSOCIATE、未知 UUID 拒绝，WS 0-RTT 的 TCP / UDP 链路，**同机两个 UDP ASSOCIATE 互不串流**，以及服务端 UDP 会话按 `udpIdle` 回收。
+- `core/xray_interop_test.go`（env-gated，`VL_CORE_XRAY_BIN`）：与官方 Xray 的 8 组交叉互通，含 `?ed=2048` 0-RTT 双向。CI 里有独立的 `interop` job 自动跑这一组。
 
 ---
 
@@ -199,17 +200,25 @@ go test ./...
 
 两个 GitHub Actions workflow：
 
-- `.github/workflows/ci.yml`：每次 push / PR 跑 `gofmt -l .`、`go build ./...`、`go vet ./...`、`go test ./... -count=1`。
-- `.github/workflows/release.yml`：推送 `v*` tag（或在 Actions 页手动指定已有 tag）触发。交叉编译 6 个目标（linux / windows / darwin × amd64 / arm64，`CGO_ENABLED=0`、`-trimpath`、`-ldflags "-s -w"`），打包为 `.tar.gz`（Windows 为 `.zip`），生成 SHA256 校验和，并上传到 GitHub Release。
+- `.github/workflows/ci.yml`：两个 job。
+  - `test`：每次 push / PR 跑 `gofmt -l .`、`go build ./...`、`go vet ./...`、`go test ./... -count=1`。
+  - `interop`：下载固定版本 `Xray-linux-64.zip`（`XRAY_VERSION`，当前 `v26.10.31`），以 `VL_CORE_XRAY_BIN` 指向它跑 `TestInterop`，保证 8 组官方互通不会只在本地被验证。
+- `.github/workflows/release.yml`：推送 `v*` tag（或在 Actions 页手动指定已有 tag）触发。交叉编译 6 个目标（linux / windows / darwin × amd64 / arm64，`CGO_ENABLED=0`、`-trimpath`、`-ldflags "-s -w"`），打包为 `.tar.gz`（Windows 为 `.zip`），生成 SHA256 校验和，并上传到 GitHub Release。手动指定 tag 时 checkout 会用 `ref: inputs.tag || github.ref`，避免拿默认分支 HEAD 构建却发布成旧 tag。
 
 发一个版本：
 
 ```bash
-git tag -a v0.1.0 -m "v0.1.0"
-git push origin v0.1.0
+git tag -a v0.1.2 -m "v0.1.2"
+git push origin v0.1.2
 ```
 
-Release 资产命名 `vl-core-v0.1.0-<os>-<arch>.tar.gz` / `.zip`，每个资产附带同名 `.sha256`；压缩包内含二进制、`README.md` 和 `examples/`。重复执行 workflow 会用 `--clobber` 覆盖同名资产，不会因 release 已存在而失败。
+Release 资产命名 `vl-core-v0.1.2-<os>-<arch>.tar.gz` / `.zip`，每个资产附带同名 `.sha256`；压缩包内含二进制、`README.md` 和 `examples/`。重复执行 workflow 会用 `--clobber` 覆盖同名资产，不会因 release 已存在而失败。
+
+---
+
+## 许可证
+
+[MIT](LICENSE) © 2026 purepoorx
 
 ---
 

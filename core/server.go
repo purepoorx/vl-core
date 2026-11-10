@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"vless-core/protocol"
-	"vless-core/transport"
+	"github.com/purepoorx/vl-core/protocol"
+	"github.com/purepoorx/vl-core/transport"
 )
 
 // Server is a VLESS inbound: it accepts VLESS connections, authenticates the
@@ -195,6 +195,12 @@ func (s *Server) handle(conn net.Conn) {
 // handleUDP forwards length-prefixed VLESS datagrams to a single UDP target.
 // Uplink and downlink run independently so multiple responses (or a response
 // arriving later) are handled correctly.
+//
+// Unlike a TCP stream, an idle UDP session produces no traffic at all, so it is
+// bounded by udpIdle: the deadline is pushed forward on every datagram in
+// either direction, and the session is torn down once nothing arrives before it
+// expires. Using the stream idle setting here would leave UDP sockets open
+// forever by default, because idle=0 means "no limit".
 func (s *Server) handleUDP(conn net.Conn, br *bufio.Reader, bw *bufio.Writer, req *protocol.RequestHeader) error {
 	raddr, err := net.ResolveUDPAddr("udp", req.Address.String())
 	if err != nil {
@@ -205,9 +211,17 @@ func (s *Server) handleUDP(conn net.Conn, br *bufio.Reader, bw *bufio.Writer, re
 		return fmt.Errorf("dial udp target: %w", err)
 	}
 	defer uc.Close()
-	if d := s.cfg.IdleTimeout(); d > 0 {
-		_ = uc.SetDeadline(time.Now().Add(d))
+
+	idle := s.cfg.UDPIdleTimeout()
+	refresh := func() {
+		if idle <= 0 {
+			return
+		}
+		dl := time.Now().Add(idle)
+		_ = conn.SetDeadline(dl)
+		_ = uc.SetDeadline(dl)
 	}
+	refresh()
 
 	go func() {
 		for {
@@ -219,6 +233,7 @@ func (s *Server) handleUDP(conn net.Conn, br *bufio.Reader, bw *bufio.Writer, re
 			if len(pkt) == 0 {
 				continue
 			}
+			refresh()
 			if _, err := uc.Write(pkt); err != nil {
 				return
 			}
@@ -231,6 +246,7 @@ func (s *Server) handleUDP(conn net.Conn, br *bufio.Reader, bw *bufio.Writer, re
 		if err != nil {
 			return err
 		}
+		refresh()
 		if err := protocol.WritePacket(bw, buf[:n]); err != nil {
 			return err
 		}

@@ -8,7 +8,7 @@ import (
 	"io"
 	"net"
 
-	"vless-core/protocol"
+	"github.com/purepoorx/vl-core/protocol"
 )
 
 // handleSocks5 implements RFC 1928 (no-auth) CONNECT and UDP ASSOCIATE.
@@ -123,26 +123,28 @@ func (c *Client) socksConnect(local net.Conn, br *bufio.Reader, addr protocol.Ad
 }
 
 // socksUDPAssociate keeps the association alive for as long as its control TCP
-// connection stays open, as required by RFC 1928.
+// connection stays open, as required by RFC 1928. The relay socket is created
+// per association, so the advertised port is unique to this session.
 func (c *Client) socksUDPAssociate(local net.Conn, br *bufio.Reader) {
-	udp := c.UDPAddr()
-	if udp == nil {
-		_ = socksReply(local, 0x05, nil)
+	relay, err := listenRelaySocket(local)
+	if err != nil {
+		c.log.Warn("socks UDP ASSOCIATE relay socket: %v", err)
+		_ = socksReply(local, 0x01, nil) // general SOCKS server failure
 		return
 	}
-	advertise := &net.UDPAddr{IP: udp.IP, Port: udp.Port}
+	advertise := relay.LocalAddr().(*net.UDPAddr)
 	if advertise.IP.IsUnspecified() {
-		advertise.IP = net.IPv4(127, 0, 0, 1)
+		advertise = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: advertise.Port}
 	}
 	if err := socksReply(local, 0x00, advertise); err != nil {
+		_ = relay.Close()
 		return
 	}
 
-	key := ""
-	if ta, ok := local.RemoteAddr().(*net.TCPAddr); ok {
-		key = ta.IP.String()
+	a := c.newAssociate(relay)
+	if a == nil {
+		return
 	}
-	a := c.newAssociate(key)
 	defer c.removeAssociate(a)
 
 	c.log.Debug("socks UDP ASSOCIATE from %s (relay %s)", local.RemoteAddr(), advertise)

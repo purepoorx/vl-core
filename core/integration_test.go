@@ -9,6 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/binary"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -18,8 +19,8 @@ import (
 	"testing"
 	"time"
 
-	"vless-core/protocol"
-	"vless-core/transport"
+	"github.com/purepoorx/vl-core/protocol"
+	"github.com/purepoorx/vl-core/transport"
 )
 
 const itestUUID = "b831381d-6324-4d53-ad4f-8cda48b30811"
@@ -355,33 +356,42 @@ func TestEndToEndWebSocketEarlyDataUDP(t *testing.T) {
 	}
 }
 
-// socksUDPExchange performs one SOCKS5 UDP ASSOCIATE exchange through proxy
-// and returns the datagram payload of the first reply (SOCKS header stripped).
-func socksUDPExchange(t *testing.T, proxy, host string, port uint16, payload []byte) []byte {
+// socksUDPAssociate opens a SOCKS5 UDP ASSOCIATE session and returns the
+// control connection, the advertised relay address, and a loopback socket the
+// caller sends datagrams from. The control connection must stay open for the
+// association to remain valid (RFC 1928).
+func socksUDPAssociate(t *testing.T, proxy string) (net.Conn, *net.UDPAddr, *net.UDPConn) {
 	t.Helper()
 	control, err := net.DialTimeout("tcp", proxy, 3*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer control.Close()
-	_ = control.SetDeadline(time.Now().Add(10 * time.Second))
+	if err := control.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		control.Close()
+		t.Fatal(err)
+	}
 
 	// SOCKS5 greeting, then UDP ASSOCIATE request with 0.0.0.0:0.
 	if _, err := control.Write([]byte{0x05, 0x01, 0x00}); err != nil {
+		control.Close()
 		t.Fatal(err)
 	}
 	var greet [2]byte
 	if _, err := io.ReadFull(control, greet[:]); err != nil || greet[1] != 0 {
+		control.Close()
 		t.Fatalf("socks greeting failed: %v %v", greet, err)
 	}
 	if _, err := control.Write([]byte{0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
+		control.Close()
 		t.Fatal(err)
 	}
 	var head [4]byte
 	if _, err := io.ReadFull(control, head[:]); err != nil {
+		control.Close()
 		t.Fatal(err)
 	}
 	if head[1] != 0 {
+		control.Close()
 		t.Fatalf("UDP ASSOCIATE rejected: rep=0x%02x", head[1])
 	}
 	var bindIP []byte
@@ -391,24 +401,34 @@ func socksUDPExchange(t *testing.T, proxy, host string, port uint16, payload []b
 	case 0x04:
 		bindIP = make([]byte, 16)
 	default:
+		control.Close()
 		t.Fatalf("unexpected bind atyp %d", head[3])
 	}
 	if _, err := io.ReadFull(control, bindIP); err != nil {
+		control.Close()
 		t.Fatal(err)
 	}
 	var pb [2]byte
 	if _, err := io.ReadFull(control, pb[:]); err != nil {
+		control.Close()
 		t.Fatal(err)
 	}
 	relay := &net.UDPAddr{IP: net.IP(bindIP), Port: int(binary.BigEndian.Uint16(pb[:]))}
 
 	local, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
+		control.Close()
 		t.Fatal(err)
 	}
-	defer local.Close()
-	_ = local.SetDeadline(time.Now().Add(10 * time.Second))
+	if err := local.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		local.Close()
+		control.Close()
+		t.Fatal(err)
+	}
+	return control, relay, local
+}
 
+func socksUDPPayload(host string, port uint16, payload []byte) []byte {
 	req := []byte{0x00, 0x00, 0x00}
 	if ip := net.ParseIP(host).To4(); ip != nil {
 		req = append(req, 0x01)
@@ -418,16 +438,53 @@ func socksUDPExchange(t *testing.T, proxy, host string, port uint16, payload []b
 		req = append(req, host...)
 	}
 	req = append(req, byte(port>>8), byte(port))
-	req = append(req, payload...)
-	if _, err := local.WriteToUDP(req, relay); err != nil {
+	return append(req, payload...)
+}
+
+// socksUDPExchange performs one SOCKS5 UDP ASSOCIATE exchange through proxy
+// and returns the datagram payload of the first reply (SOCKS header stripped).
+func socksUDPExchange(t *testing.T, proxy, host string, port uint16, payload []byte) []byte {
+	t.Helper()
+	control, relay, local := socksUDPAssociate(t, proxy)
+	defer control.Close()
+	defer local.Close()
+
+	if _, err := local.WriteToUDP(socksUDPPayload(host, port, payload), relay); err != nil {
 		t.Fatal(err)
 	}
+	return readSocksUDP(t, local)
+}
+
+func readSocksUDP(t *testing.T, conn *net.UDPConn) []byte {
+	t.Helper()
 	buf := make([]byte, 2048)
-	n, _, err := local.ReadFromUDP(buf)
+	n, _, err := conn.ReadFromUDP(buf)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return parseSocksUDPReply(t, buf[:n])
+}
+
+// expectNoDatagram asserts that nothing arrives within d, then restores the
+// socket deadline. Used to prove that one association cannot see another's
+// replies.
+func expectNoDatagram(t *testing.T, conn *net.UDPConn, d time.Duration) {
+	t.Helper()
+	if err := conn.SetReadDeadline(time.Now().Add(d)); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 2048)
+	n, _, err := conn.ReadFromUDP(buf)
+	if err == nil {
+		t.Fatalf("unexpected datagram leaked into another association: %x", buf[:n])
+	}
+	var ne net.Error
+	if !errors.As(err, &ne) || !ne.Timeout() {
+		t.Fatalf("expected read timeout, got %v", err)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func parseSocksUDPReply(t *testing.T, p []byte) []byte {
@@ -467,6 +524,122 @@ func TestEndToEndUDP(t *testing.T) {
 	got := socksUDPExchange(t, cli.Addr().String(), host, port, payload)
 	if string(got) != string(payload) {
 		t.Fatalf("udp echo = %x, want %x", got, payload)
+	}
+}
+
+// TestEndToEndUDPAssociateIsolation is a regression test for a relay socket
+// shared by every association and keyed by client IP: two SOCKS5 clients on the
+// same host were advertised the same port and one of them never got replies.
+func TestEndToEndUDPAssociateIsolation(t *testing.T) {
+	target := startUDPEcho(t)
+	host, port := splitHostPort(t, target)
+	cli, _ := startPair(t, "socks5", nil, nil)
+	proxy := cli.Addr().String()
+
+	ctrlA, relayA, localA := socksUDPAssociate(t, proxy)
+	defer ctrlA.Close()
+	defer localA.Close()
+	ctrlB, relayB, localB := socksUDPAssociate(t, proxy)
+	defer ctrlB.Close()
+	defer localB.Close()
+
+	if relayA.Port == relayB.Port {
+		t.Fatalf("both associations advertised relay port %d; each needs its own socket", relayA.Port)
+	}
+
+	// A sends and must receive its own echo.
+	if _, err := localA.WriteToUDP(socksUDPPayload(host, port, []byte("from-A-1")), relayA); err != nil {
+		t.Fatal(err)
+	}
+	if got := readSocksUDP(t, localA); string(got) != "from-A-1" {
+		t.Fatalf("association A got %q, want %q", got, "from-A-1")
+	}
+	// A's reply must not reach B.
+	expectNoDatagram(t, localB, 300*time.Millisecond)
+
+	// B sends and must receive its own echo, not A's.
+	if _, err := localB.WriteToUDP(socksUDPPayload(host, port, []byte("from-B-1")), relayB); err != nil {
+		t.Fatal(err)
+	}
+	if got := readSocksUDP(t, localB); string(got) != "from-B-1" {
+		t.Fatalf("association B got %q, want %q", got, "from-B-1")
+	}
+	// B's reply must not reach A.
+	expectNoDatagram(t, localA, 300*time.Millisecond)
+}
+
+// TestServerUDPIdleTimeout guards against UDP sessions living forever: the
+// server used to apply the stream idle setting, whose default of 0 means "no
+// limit", to the UDP socket.
+func TestServerUDPIdleTimeout(t *testing.T) {
+	target := startUDPEcho(t)
+	host, port := splitHostPort(t, target)
+
+	srv, err := NewServer(&Config{
+		Role:     "server",
+		Listen:   "127.0.0.1:0",
+		Users:    []UserConfig{{ID: itestUUID}},
+		Timeouts: TimeoutConfig{UDPIdle: 1},
+	}, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = srv.Serve() }()
+	addr := waitAddr(t, srv.Addr)
+	t.Cleanup(func() { _ = srv.Close() })
+
+	conn, err := net.Dial("tcp", addr.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	id, err := protocol.ParseUUID(itestUUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &protocol.RequestHeader{
+		Version: protocol.Version,
+		UUID:    id,
+		Addons:  &protocol.Addons{},
+		Command: protocol.CommandUDP,
+		Address: protocol.ParseAddress(host, port),
+	}
+	if err := protocol.WriteRequestHeader(conn, h); err != nil {
+		t.Fatal(err)
+	}
+	br := bufio.NewReader(conn)
+	if _, err := protocol.ReadResponseHeader(br, protocol.Version); err != nil {
+		t.Fatal(err)
+	}
+	if err := protocol.WritePacket(conn, []byte("ping")); err != nil {
+		t.Fatal(err)
+	}
+	pkt, err := protocol.ReadPacket(br)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(pkt) != "ping" {
+		t.Fatalf("udp echo = %q, want %q", pkt, "ping")
+	}
+
+	// Stay silent: the server must drop the session once udpIdle elapses.
+	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	_, err = br.ReadByte()
+	if err == nil {
+		t.Fatal("server kept the idle UDP session open")
+	}
+	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		t.Fatalf("server never closed the idle UDP session (waited %s)", time.Since(start).Round(time.Millisecond))
+	}
+	if elapsed := time.Since(start); elapsed < 500*time.Millisecond {
+		t.Fatalf("session closed after %s, before udpIdle elapsed", elapsed.Round(time.Millisecond))
 	}
 }
 

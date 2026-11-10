@@ -100,6 +100,58 @@ func TestAddonsWireFormat(t *testing.T) {
 	}
 }
 
+// TestAddonsUnknownFieldsByWireType covers forward compatibility: a newer peer
+// may add fields using any protobuf wire type, and those must be skipped rather
+// than rejecting the whole VLESS header.
+func TestAddonsUnknownFieldsByWireType(t *testing.T) {
+	flow := appendVarint(nil, 1<<3|2)
+	flow = appendVarint(flow, uint64(len(FlowVision)))
+	flow = append(flow, FlowVision...)
+
+	seed := appendVarint(nil, 2<<3|2)
+	seed = appendVarint(seed, 2)
+	seed = append(seed, 0xaa, 0xbb)
+
+	unknownVarint := appendVarint(nil, 3<<3|0)
+	unknownVarint = appendVarint(unknownVarint, 300)
+	unknownFixed64 := append(appendVarint(nil, 4<<3|1), 1, 2, 3, 4, 5, 6, 7, 8)
+	unknownFixed32 := append(appendVarint(nil, 6<<3|5), 9, 10, 11, 12)
+
+	raw := append(append(append(append([]byte{}, flow...), seed...), unknownVarint...), unknownFixed64...)
+	raw = append(raw, unknownFixed32...)
+
+	a, err := UnmarshalAddons(raw)
+	if err != nil {
+		t.Fatalf("unknown wire types rejected: %v", err)
+	}
+	if a.Flow != FlowVision || !bytes.Equal(a.Seed, []byte{0xaa, 0xbb}) {
+		t.Fatalf("decoded = %+v", a)
+	}
+	wantRaw := append(append(append([]byte{}, unknownVarint...), unknownFixed64...), unknownFixed32...)
+	if !bytes.Equal(a.Raw, wantRaw) {
+		t.Fatalf("raw = %x, want %x", a.Raw, wantRaw)
+	}
+	if !bytes.Equal(MarshalAddons(a), raw) {
+		t.Fatalf("re-encode = %x, want %x", MarshalAddons(a), raw)
+	}
+
+	// A known field with the wrong wire type is still a schema violation.
+	if _, err := UnmarshalAddons(append(appendVarint(nil, 1<<3|0), 7)); !errors.Is(err, ErrBadAddons) {
+		t.Fatalf("flow encoded as varint: %v", err)
+	}
+	// Groups are not valid in proto3.
+	if _, err := UnmarshalAddons(appendVarint(nil, 3<<3|3)); !errors.Is(err, ErrBadAddons) {
+		t.Fatalf("group field: %v", err)
+	}
+	// Truncated fixed-width fields must not read past the buffer.
+	if _, err := UnmarshalAddons(append(appendVarint(nil, 6<<3|5), 1, 2)); !errors.Is(err, ErrBadAddons) {
+		t.Fatalf("truncated fixed32: %v", err)
+	}
+	if _, err := UnmarshalAddons(append(appendVarint(nil, 4<<3|1), 1, 2, 3)); !errors.Is(err, ErrBadAddons) {
+		t.Fatalf("truncated fixed64: %v", err)
+	}
+}
+
 func TestAddressRoundTrip(t *testing.T) {
 	cases := []struct {
 		name string

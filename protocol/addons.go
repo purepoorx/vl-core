@@ -42,8 +42,13 @@ func MarshalAddons(a *Addons) []byte {
 	return out
 }
 
-// UnmarshalAddons parses protobuf wire bytes. Only length-delimited fields are
-// legal in the current Addons schema.
+// UnmarshalAddons parses protobuf wire bytes.
+//
+// The current schema declares only length-delimited fields, but a peer running
+// a newer revision may append fields this core does not know about. Those are
+// consumed according to their wire type and kept verbatim in Raw, so the header
+// survives a decode/encode round trip instead of being rejected wholesale.
+// Groups (wire types 3 and 4) are not part of proto3 and are refused.
 func UnmarshalAddons(b []byte) (*Addons, error) {
 	a := &Addons{}
 	for i := 0; i < len(b); {
@@ -54,26 +59,56 @@ func UnmarshalAddons(b []byte) (*Addons, error) {
 		}
 		i += n
 		field, wire := tag>>3, tag&7
-		if field == 0 || wire != 2 {
+		if field == 0 {
 			return nil, ErrBadAddons
 		}
-		length, n := consumeVarint(b[i:])
-		if n <= 0 {
+		known := field == 1 || field == 2
+		if known && wire != 2 {
 			return nil, ErrBadAddons
 		}
-		i += n
-		if length > uint64(len(b)-i) {
+
+		var value []byte
+		switch wire {
+		case 0: // varint
+			_, n := consumeVarint(b[i:])
+			if n <= 0 {
+				return nil, ErrBadAddons
+			}
+			i += n
+		case 1: // fixed64
+			if len(b)-i < 8 {
+				return nil, ErrBadAddons
+			}
+			i += 8
+		case 2: // length-delimited
+			length, n := consumeVarint(b[i:])
+			if n <= 0 {
+				return nil, ErrBadAddons
+			}
+			i += n
+			if length > uint64(len(b)-i) {
+				return nil, ErrBadAddons
+			}
+			value = b[i : i+int(length)]
+			i += int(length)
+		case 5: // fixed32
+			if len(b)-i < 4 {
+				return nil, ErrBadAddons
+			}
+			i += 4
+		default: // 3, 4 (groups), 6, 7 (invalid)
 			return nil, ErrBadAddons
 		}
-		value := b[i : i+int(length)]
-		i += int(length)
+
+		if !known {
+			a.Raw = append(a.Raw, b[start:i]...)
+			continue
+		}
 		switch field {
 		case 1:
 			a.Flow = string(value)
 		case 2:
 			a.Seed = append([]byte(nil), value...)
-		default:
-			a.Raw = append(a.Raw, b[start:i]...)
 		}
 	}
 	return a, nil

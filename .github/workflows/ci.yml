@@ -39,3 +39,33 @@ jobs:
 
       - name: Test
         run: go test ./... -count=1
+
+  # The interop suite is skipped locally unless VL_CORE_XRAY_BIN is set, so
+  # without this job the byte-level compatibility checks would never run in CI.
+  interop:
+    name: Interop with official Xray
+    runs-on: ubuntu-latest
+    env:
+      XRAY_VERSION: v26.10.31
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+
+      - name: Download official Xray
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/xray"
+          curl -fsSL \
+            "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip" \
+            -o "$RUNNER_TEMP/xray.zip"
+          unzip -q "$RUNNER_TEMP/xray.zip" -d "$RUNNER_TEMP/xray"
+          chmod +x "$RUNNER_TEMP/xray/xray"
+          "$RUNNER_TEMP/xray/xray" version
+
+      - name: Interop tests
+        env:
+          VL_CORE_XRAY_BIN: ${{ runner.temp }}/xray/xray
+        run: go test ./core -run TestInterop -count=1 -v

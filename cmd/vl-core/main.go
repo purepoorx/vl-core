@@ -9,11 +9,11 @@ import (
 	"os/signal"
 	"syscall"
 
-	"vless-core/core"
-	"vless-core/protocol"
+	"github.com/purepoorx/vl-core/core"
+	"github.com/purepoorx/vl-core/protocol"
 )
 
-const version = "0.1.1"
+const version = "0.1.2"
 
 type service interface {
 	Serve() error

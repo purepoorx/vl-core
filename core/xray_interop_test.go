@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"vless-core/transport"
+	"github.com/purepoorx/vl-core/transport"
 )
 
 const (

@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"vless-core/protocol"
-	"vless-core/transport"
+	"github.com/purepoorx/vl-core/protocol"
+	"github.com/purepoorx/vl-core/transport"
 )
 
 // Client is a local proxy that accepts SOCKS5/HTTP CONNECT and tunnels the
@@ -27,9 +27,8 @@ type Client struct {
 
 	mu         sync.Mutex
 	tcpLn      net.Listener
-	udpConn    *net.UDPConn
 	conns      map[net.Conn]struct{}
-	associates map[string]*udpAssociate
+	associates map[*udpAssociate]struct{}
 	closed     bool
 }
 
@@ -67,7 +66,7 @@ func NewClient(cfg *Config, log *Logger) (*Client, error) {
 		server:     cfg.Server.Address,
 		transport:  cfg.Server.Transport,
 		conns:      make(map[net.Conn]struct{}),
-		associates: make(map[string]*udpAssociate),
+		associates: make(map[*udpAssociate]struct{}),
 	}, nil
 }
 
@@ -81,46 +80,11 @@ func (c *Client) Addr() net.Addr {
 	return c.tcpLn.Addr()
 }
 
-// UDPAddr returns the address advertised to SOCKS5 UDP ASSOCIATE clients.
-func (c *Client) UDPAddr() *net.UDPAddr {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.udpConn == nil {
-		return nil
-	}
-	return c.udpConn.LocalAddr().(*net.UDPAddr)
-}
-
+// Serve accepts local proxy connections and blocks until Close is called.
 func (c *Client) Serve() error {
 	tcpLn, err := net.Listen("tcp", c.cfg.Listen)
 	if err != nil {
 		return err
-	}
-	if c.cfg.Inbound == "socks5" {
-		host, _, err := net.SplitHostPort(c.cfg.Listen)
-		if err != nil {
-			tcpLn.Close()
-			return err
-		}
-		_, port, err := net.SplitHostPort(tcpLn.Addr().String())
-		if err != nil {
-			tcpLn.Close()
-			return err
-		}
-		udpAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, port))
-		if err != nil {
-			tcpLn.Close()
-			return err
-		}
-		udpConn, err := net.ListenUDP("udp", udpAddr)
-		if err != nil {
-			tcpLn.Close()
-			return fmt.Errorf("listen udp for socks5 UDP ASSOCIATE: %w", err)
-		}
-		c.mu.Lock()
-		c.udpConn = udpConn
-		c.mu.Unlock()
-		go c.serveSocksUDP(udpConn)
 	}
 
 	c.mu.Lock()
@@ -178,13 +142,13 @@ func (c *Client) Close() error {
 		return nil
 	}
 	c.closed = true
-	tcpLn, udpConn := c.tcpLn, c.udpConn
+	tcpLn := c.tcpLn
 	conns := make([]net.Conn, 0, len(c.conns))
 	for conn := range c.conns {
 		conns = append(conns, conn)
 	}
 	assocs := make([]*udpAssociate, 0, len(c.associates))
-	for _, a := range c.associates {
+	for a := range c.associates {
 		assocs = append(assocs, a)
 	}
 	c.mu.Unlock()
@@ -194,9 +158,6 @@ func (c *Client) Close() error {
 	}
 	for _, a := range assocs {
 		a.close()
-	}
-	if udpConn != nil {
-		_ = udpConn.Close()
 	}
 	if tcpLn != nil {
 		return tcpLn.Close()

@@ -37,7 +37,12 @@ jobs:
       GOARCH: ${{ matrix.goarch }}
       CGO_ENABLED: "0"
     steps:
+      # workflow_dispatch may target an older tag: check that ref out explicitly,
+      # otherwise the default branch HEAD is compiled but published under the
+      # requested tag.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - uses: actions/setup-go@v5
         with:
           go-version: stable
