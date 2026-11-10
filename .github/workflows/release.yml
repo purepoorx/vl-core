@@ -57,7 +57,7 @@ jobs:
           if [ "$GOOS" = "windows" ]; then bin="vl-core.exe"; else bin="vl-core"; fi
           mkdir -p "stage/${name}" out
           go build -trimpath -ldflags "-s -w -buildid=" -o "stage/${name}/${bin}" ./cmd/vl-core
-          cp README.md "stage/${name}/"
+          cp README.md LICENSE "stage/${name}/"
           cp -R examples "stage/${name}/"
           if [ "$GOOS" = "windows" ]; then
             (cd stage && zip -q -r "../out/${name}.zip" "${name}")
